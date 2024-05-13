@@ -9,6 +9,9 @@ from timm.models.vision_transformer import _cfg
 from timm.models.vision_transformer import Block as TimmBlock
 from timm.models.vision_transformer import Attention as TimmAttention
 
+# Grid Positional Encoding
+from gridPE import *
+
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -108,6 +111,197 @@ class Attention(nn.Module):
             kv = self.kv(x).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         k, v = kv[0], kv[1]
 
+        # 在这里加grid编码
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return x
+
+
+class AbsAttention(nn.Module):
+    # 不用相对编码，因为文献报告表明相对编码性能不行。如果需要再加。
+    @classmethod
+    def get_emb(cls, sin_inp):
+        """
+        Gets a base embedding for one dimension with sin and cos intertwined
+        """
+        emb = torch.stack((sin_inp.sin(), sin_inp.cos()), dim=-1)
+        return torch.flatten(emb, -2, -1)
+    
+    def abs_pos_encoding(self, x, H, W):
+        B, N, C = x.shape
+        channels = int(np.ceil(C / 4) * 2)
+
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, channels, 2).float() / channels))
+        # 创建位置编码, 这里head_dim是一个头的维度
+        pos_x = torch.arange(H, device=x.device, dtype=inv_freq.dtype)
+        pos_y = torch.arange(W, device=x.device, dtype=inv_freq.dtype)
+        sin_inp_x = torch.einsum("i,j->ij", pos_x, inv_freq)
+        sin_inp_y = torch.einsum("i,j->ij", pos_y, inv_freq)
+        emb_x = AbsAttention.get_emb(sin_inp_x)
+        emb_y = AbsAttention.get_emb(sin_inp_y)
+        emb = torch.zeros(
+            (H, W, 2 * channels),
+            device=x.device,
+            dtype=x.dtype,           
+        )
+        emb[:, :, : channels] = emb_x
+        emb[:, :, channels : 2 * channels] = emb_y
+
+        abs_embedding = emb[None, :, :, :C].repeat(x.shape[0], 1, 1, 1)
+        abs_embedding = abs_embedding.reshape(B, N, C)
+        return abs_embedding
+
+    def forward(self, x, H, W):
+        abs_embedding = self.abs_pos_encoding(x, H, W)
+        x = x + abs_embedding
+        x = super(AbsAttention, self).forward(x, H, W)
+        return x
+
+
+class GridSplitAttention(Attention):
+    """
+    GridSplitAttention is a class that performs attention mechanism with grid remapping.
+    """
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+        q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+
+        if self.sr_ratio > 1:
+            x_ = x.permute(0, 2, 1).reshape(B, C, H, W)
+            x_ = self.sr(x_).reshape(B, C, -1).permute(0, 2, 1)
+            x_ = self.norm(x_)
+            kv = self.kv(x_).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        else:
+            kv = self.kv(x).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]
+
+        # 创建位置编码, 这里head_dim是一个头的维度
+        pos_list = [(i, j) for i in range(H) for j in range(W)]
+        grid_pe = GridSplitPositionalEncoding(pos_list, self.head_dim)
+
+        # 应用位置编码到查询和键
+        q = grid_pe.apply_encoding(
+            q
+        )  
+        # 内部是在做位置编码和输入的矩阵乘法
+        k = grid_pe.apply_encoding(
+            k
+        )  
+
+        # 在这里加grid编码
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return x
+
+
+class GridMergingAttention(Attention):
+    def forward(self, x, H, W):
+        # 创建位置编码
+        pos_list = [(i, j) for i in range(H) for j in range(W)]
+        grid_pe = GridMergingPositionalEncoding(pos_list, self.embed_dim) # 计算位置编码
+        grid_pe_tensor = torch.from_numpy(grid_pe.grid_pe).float()
+        grid_pe_tensor = grid_pe_tensor.transpose(0,1) # 转置为[seq_length, embed_dim]
+        grid_pe_expanded = grid_pe_tensor.unsqueeze(0) # 扩展为[1, seq_length, embed_dim]
+
+        x += grid_pe_expanded.to(x.device) # 加到输入x上
+
+        x = super(GridMergingAttention, self).forward(x, H, W)
+        return x
+
+
+class GridComplexAttention(Attention):
+    """
+    GridSplitAttention is a class that performs attention mechanism with grid remapping.
+    """
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+        q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+
+        if self.sr_ratio > 1:
+            x_ = x.permute(0, 2, 1).reshape(B, C, H, W)
+            x_ = self.sr(x_).reshape(B, C, -1).permute(0, 2, 1)
+            x_ = self.norm(x_)
+            kv = self.kv(x_).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        else:
+            kv = self.kv(x).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]
+
+        # 创建位置编码, 这里head_dim是一个头的维度
+        pos_list = [(i, j) for i in range(H) for j in range(W)]
+        grid_pe = GridComplexPositionalEncoding(pos_list, self.head_dim)
+
+        # 应用位置编码到查询和键
+        q = grid_pe.apply_encoding(
+            q
+        )  
+        # 内部是在做位置编码和输入的矩阵乘法
+        k = grid_pe.apply_encoding(
+            k
+        )  
+
+        # 在这里加grid编码
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.real
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return x
+
+
+class GridDeepAttention(Attention):
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+        q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+
+        if self.sr_ratio > 1:
+            x_ = x.permute(0, 2, 1).reshape(B, C, H, W)
+            x_ = self.sr(x_).reshape(B, C, -1).permute(0, 2, 1)
+            x_ = self.norm(x_)
+            kv = self.kv(x_).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        else:
+            kv = self.kv(x).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]
+
+        # 创建位置编码, 这里head_dim是一个头的维度
+        pos_list = [(i, j) for i in range(H) for j in range(W)]
+        grid_pe = GridDeepPositionalEncoding(pos_list, self.head_dim)
+        
+        # 建立网络
+        model = ComplexToReal(grid_pe.grid_pe.shape[1], grid_pe.grid_pe.shape[1]) # 输入和输出维度不改变
+        # 确保是一个复数张量
+        if not isinstance(grid_pe.grid_pe, torch.Tensor):
+            grid_pe.grid_pe = torch.view_as_complex(torch.from_numpy(np.stack((grid_pe.grid_pe.real, grid_pe.grid_pe.imag), axis=-1)))
+        # 通过实虚部分离, 直接转成一个实向量.
+        # 现在已经是实数了
+        grid_pe.grid_pe = model(grid_pe.grid_pe)
+
+
+        # 应用位置编码到查询和键
+        q = grid_pe.apply_encoding(
+            q
+        )  
+        # 内部是在做位置编码和输入的矩阵乘法
+        k = grid_pe.apply_encoding(
+            k
+        )  
+
+        # 在这里加grid编码
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
@@ -122,10 +316,10 @@ class Attention(nn.Module):
 class Block(nn.Module):
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, sr_ratio=1):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, sr_ratio=1, attention=Attention):        
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = Attention(
+        self.attn = attention(
             dim,
             num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
             attn_drop=attn_drop, proj_drop=drop, sr_ratio=sr_ratio)
@@ -140,7 +334,7 @@ class Block(nn.Module):
 
         return x
 
-
+        
 class SBlock(TimmBlock):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, sr_ratio=1):
@@ -201,7 +395,7 @@ class PyramidVisionTransformer(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dims=[64, 128, 256, 512],
                  num_heads=[1, 2, 4, 8], mlp_ratios=[4, 4, 4, 4], qkv_bias=False, qk_scale=None, drop_rate=0.,
                  attn_drop_rate=0., drop_path_rate=0., norm_layer=nn.LayerNorm,
-                 depths=[3, 4, 6, 3], sr_ratios=[8, 4, 2, 1], block_cls=Block):
+                 depths=[3, 4, 6, 3], sr_ratios=[8, 4, 2, 1], block_cls=Block, attention=Attention):
         super().__init__()
         self.num_classes = num_classes
         self.depths = depths
@@ -226,12 +420,18 @@ class PyramidVisionTransformer(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
         cur = 0
         for k in range(len(depths)):
-            _block = nn.ModuleList([block_cls(
+            _blocklist = [block_cls(
                 dim=embed_dims[k], num_heads=num_heads[k], mlp_ratio=mlp_ratios[k], qkv_bias=qkv_bias,
                 qk_scale=qk_scale,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[cur + i], norm_layer=norm_layer,
-                sr_ratio=sr_ratios[k])
-                for i in range(depths[k])])
+                sr_ratio=sr_ratios[k], attention=Attention)
+                for i in range(depths[k] - 1)]
+            _blocklist.insert(0, block_cls(
+                dim=embed_dims[k], num_heads=num_heads[k], mlp_ratio=mlp_ratios[k], qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[cur + 0], norm_layer=norm_layer,
+                sr_ratio=sr_ratios[k], attention=attention))
+            _block = nn.ModuleList(_blocklist)
             self.blocks.append(_block)
             cur += depths[k]
 
@@ -283,6 +483,7 @@ class PyramidVisionTransformer(nn.Module):
             if i == len(self.depths) - 1:
                 cls_tokens = self.cls_token.expand(B, -1, -1)
                 x = torch.cat((cls_tokens, x), dim=1)
+            # 这里用的pvt模型，非常类似于deit，但是没有cls token，这里就不用cls token了
             x = x + self.pos_embeds[i]
             x = self.pos_drops[i](x)
             for blk in self.blocks[i]:
@@ -336,7 +537,7 @@ class CPVTV2(PyramidVisionTransformer):
                  depths=[3, 4, 6, 3], sr_ratios=[8, 4, 2, 1], block_cls=Block):
         super(CPVTV2, self).__init__(img_size, patch_size, in_chans, num_classes, embed_dims, num_heads, mlp_ratios,
                                      qkv_bias, qk_scale, drop_rate, attn_drop_rate, drop_path_rate, norm_layer, depths,
-                                     sr_ratios, block_cls)
+                                     sr_ratios, block_cls, attention=Attention)
         del self.pos_embeds
         del self.cls_token
         self.pos_block = nn.ModuleList(
@@ -382,6 +583,16 @@ class CPVTV2(PyramidVisionTransformer):
         x = self.norm(x)
 
         return x.mean(dim=1)  # GAP here
+
+
+class GridPVT(PyramidVisionTransformer):
+    def __init__(self, attention, img_size=224, patch_size=4, in_chans=3, num_classes=1000, embed_dims=[64, 128, 256, 512],
+                 num_heads=[1, 2, 4, 8], mlp_ratios=[4, 4, 4, 4], qkv_bias=False, qk_scale=None, drop_rate=0.,
+                 attn_drop_rate=0., drop_path_rate=0., norm_layer=nn.LayerNorm,
+                 depths=[3, 4, 6, 3], sr_ratios=[8, 4, 2, 1], block_cls=Block,):
+        super(GridPVT, self).__init__(img_size, patch_size, in_chans, num_classes, embed_dims, num_heads,
+                                                    mlp_ratios, qkv_bias, qk_scale, drop_rate, attn_drop_rate,
+                                                    drop_path_rate, norm_layer, depths, sr_ratios, block_cls, attention)
 
 
 class PCPVT(CPVTV2):
@@ -458,6 +669,50 @@ def pcpvt_large_v0(pretrained=False, **kwargs):
     model = CPVTV2(
         patch_size=4, embed_dims=[64, 128, 320, 512], num_heads=[1, 2, 5, 8], mlp_ratios=[8, 8, 4, 4], qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=[3, 8, 27, 3], sr_ratios=[8, 4, 2, 1],
+        **kwargs)
+    model.default_cfg = _cfg()
+    return model
+
+
+@register_model
+def gridpvt_split(pretrained=False, **kwargs):
+    model = GridPVT(
+        attention=GridSplitAttention,
+        patch_size=4, embed_dims=[64, 128, 320, 512], num_heads=[1, 2, 5, 8], mlp_ratios=[8, 8, 4, 4], qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=[3, 4, 6, 3], sr_ratios=[8, 4, 2, 1],
+        **kwargs)
+    model.default_cfg = _cfg()
+    return model
+
+
+@register_model
+def gridpvt_merge(pretrained=False, **kwargs):
+    model = GridPVT(
+        attention=GridMergingAttention,        
+        patch_size=4, embed_dims=[64, 128, 320, 512], num_heads=[1, 2, 5, 8], mlp_ratios=[8, 8, 4, 4], qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=[3, 4, 6, 3], sr_ratios=[8, 4, 2, 1],
+        **kwargs)
+    model.default_cfg = _cfg()
+    return model
+
+
+@register_model
+def gridpvt_complex(pretrained=False, **kwargs):
+    model = GridPVT(
+        attention=GridComplexAttention,        
+        patch_size=4, embed_dims=[64, 128, 320, 512], num_heads=[1, 2, 5, 8], mlp_ratios=[8, 8, 4, 4], qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=[3, 4, 6, 3], sr_ratios=[8, 4, 2, 1],
+        **kwargs)
+    model.default_cfg = _cfg()
+    return model
+
+
+@register_model
+def gridpvt_deep(pretrained=False, **kwargs):
+    model = GridPVT(
+        attention=GridDeepAttention,        
+        patch_size=4, embed_dims=[64, 128, 320, 512], num_heads=[1, 2, 5, 8], mlp_ratios=[8, 8, 4, 4], qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=[3, 4, 6, 3], sr_ratios=[8, 4, 2, 1],
         **kwargs)
     model.default_cfg = _cfg()
     return model
