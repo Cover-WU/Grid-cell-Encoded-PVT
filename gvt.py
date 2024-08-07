@@ -123,7 +123,7 @@ class Attention(nn.Module):
         return x
 
 
-class AbsAttention(nn.Module):
+class AbsAttention(Attention):
     # 不用相对编码，因为文献报告表明相对编码性能不行。如果需要再加。
     @classmethod
     def get_emb(cls, sin_inp):
@@ -138,7 +138,12 @@ class AbsAttention(nn.Module):
         channels = int(np.ceil(C / 4) * 2)
 
         inv_freq = 1.0 / (10000 ** (torch.arange(0, channels, 2).float() / channels))
+        inv_freq = inv_freq.to(x.device)
         # 创建位置编码, 这里head_dim是一个头的维度
+        
+        if N != H * W:
+            H += 1
+
         pos_x = torch.arange(H, device=x.device, dtype=inv_freq.dtype)
         pos_y = torch.arange(W, device=x.device, dtype=inv_freq.dtype)
         sin_inp_x = torch.einsum("i,j->ij", pos_x, inv_freq)
@@ -150,11 +155,13 @@ class AbsAttention(nn.Module):
             device=x.device,
             dtype=x.dtype,           
         )
-        emb[:, :, : channels] = emb_x
-        emb[:, :, channels : 2 * channels] = emb_y
+        emb[:, :, : channels] = emb_x[:, None, :]
+        emb[:, :, channels : 2 * channels] = emb_y[None, :, :]
 
         abs_embedding = emb[None, :, :, :C].repeat(x.shape[0], 1, 1, 1)
-        abs_embedding = abs_embedding.reshape(B, N, C)
+        abs_embedding = abs_embedding.reshape(B, H * W, C)
+        abs_embedding = abs_embedding[:, :N, :]
+
         return abs_embedding
 
     def forward(self, x, H, W):
@@ -174,23 +181,43 @@ class GridSplitAttention(Attention):
 
         if self.sr_ratio > 1:
             x_ = x.permute(0, 2, 1).reshape(B, C, H, W)
-            x_ = self.sr(x_).reshape(B, C, -1).permute(0, 2, 1)
+            x_ = self.sr(x_)
+            H_, W_ = x_.shape[-2], x_.shape[-1]
+            x_ = x_.reshape(B, C, -1).permute(0, 2, 1)
             x_ = self.norm(x_)
             kv = self.kv(x_).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         else:
             kv = self.kv(x).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         k, v = kv[0], kv[1]
 
+        self.head_dim = C // self.num_heads
+        if N != H * W:
+            H += 1
+            H_range = torch.arange(H, device='cuda')
+            W_range = torch.arange(W, device='cuda')
+            q_pos_list = torch.cartesian_prod(H_range, W_range)[:N]
+        else:
+            H_range = torch.arange(H, device='cuda')
+            W_range = torch.arange(W, device='cuda')
+            q_pos_list = torch.cartesian_prod(H_range, W_range)
+        
+        if self.sr_ratio > 1:
+            sample_pos_i = self.sr_ratio * torch.arange(H_, device='cuda', dtype=torch.int) + self.sr_ratio // 2
+            sample_pos_j = self.sr_ratio * torch.arange(W_, device='cuda', dtype=torch.int) + self.sr_ratio // 2
+            k_pos_list = torch.cartesian_prod(sample_pos_i, sample_pos_j)
+        else:
+            k_pos_list = q_pos_list
+            
         # 创建位置编码, 这里head_dim是一个头的维度
-        pos_list = [(i, j) for i in range(H) for j in range(W)]
-        grid_pe = GridSplitPositionalEncoding(pos_list, self.head_dim)
+        grid_pe_for_q = GridSplitPositionalEncoding(q_pos_list, self.head_dim)
+        grid_pe_for_k = GridSplitPositionalEncoding(k_pos_list, self.head_dim)
 
         # 应用位置编码到查询和键
-        q = grid_pe.apply_encoding(
+        q = grid_pe_for_q.apply_encoding(
             q
         )  
         # 内部是在做位置编码和输入的矩阵乘法
-        k = grid_pe.apply_encoding(
+        k = grid_pe_for_k.apply_encoding(
             k
         )  
 
@@ -206,14 +233,85 @@ class GridSplitAttention(Attention):
         return x
 
 
+class GridRotateAttention(Attention):
+    """
+    GridRotateAttention is a class that performs attention mechanism with grid rotation remapping.
+    """
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+        q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+
+        if self.sr_ratio > 1:
+            x_ = x.permute(0, 2, 1).reshape(B, C, H, W)
+            x_ = self.sr(x_)
+            H_, W_ = x_.shape[-2], x_.shape[-1]
+            x_ = x_.reshape(B, C, -1).permute(0, 2, 1)
+            x_ = self.norm(x_)
+            kv = self.kv(x_).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        else:
+            kv = self.kv(x).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]
+
+        self.head_dim = C // self.num_heads
+        if N != H * W:
+            H += 1
+            H_range = torch.arange(H, device='cuda')
+            W_range = torch.arange(W, device='cuda')
+            q_pos_list = torch.cartesian_prod(H_range, W_range)[:N]
+        else:
+            H_range = torch.arange(H, device='cuda')
+            W_range = torch.arange(W, device='cuda')
+            q_pos_list = torch.cartesian_prod(H_range, W_range)
+        
+        if self.sr_ratio > 1:
+            sample_pos_i = self.sr_ratio * torch.arange(H_, device='cuda', dtype=torch.int) + self.sr_ratio // 2
+            sample_pos_j = self.sr_ratio * torch.arange(W_, device='cuda', dtype=torch.int) + self.sr_ratio // 2
+            k_pos_list = torch.cartesian_prod(sample_pos_i, sample_pos_j)
+        else:
+            k_pos_list = q_pos_list
+        
+        grid_pe_for_q = GridRotatePositionalEncoding(q_pos_list, self.head_dim)
+        grid_pe_for_k = GridRotatePositionalEncoding(k_pos_list, self.head_dim)
+        
+        # 应用位置编码到查询和键
+        q = grid_pe_for_q.apply_encoding(
+            q
+        )  
+        # 内部是在做位置编码和输入的矩阵乘法
+        k = grid_pe_for_k.apply_encoding(
+            k
+        )  
+
+        # 在这里加grid编码
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return x
+
+
+
 class GridMergingAttention(Attention):
     def forward(self, x, H, W):
         # 创建位置编码
-        pos_list = [(i, j) for i in range(H) for j in range(W)]
-        grid_pe = GridMergingPositionalEncoding(pos_list, self.embed_dim) # 计算位置编码
-        grid_pe_tensor = torch.from_numpy(grid_pe.grid_pe).float()
-        grid_pe_tensor = grid_pe_tensor.transpose(0,1) # 转置为[seq_length, embed_dim]
-        grid_pe_expanded = grid_pe_tensor.unsqueeze(0) # 扩展为[1, seq_length, embed_dim]
+        B, N, C = x.shape  
+        if N != H * W:
+            H += 1
+            H_range = torch.arange(H, device='cuda')
+            W_range = torch.arange(W, device='cuda')
+            pos_list = torch.cartesian_prod(H_range, W_range)[:N]
+        else:
+            H_range = torch.arange(H, device='cuda')
+            W_range = torch.arange(W, device='cuda')
+            pos_list = torch.cartesian_prod(H_range, W_range)
+        
+        grid_merge_pe = GridMergingPositionalEncoding(pos_list, C) # 计算位置编码
+        grid_pe = grid_merge_pe.grid_pe.transpose(0,1) # 转置为[seq_length, embed_dim]
+        grid_pe_expanded = grid_pe.unsqueeze(0) # 扩展为[1, seq_length, embed_dim]
 
         x += grid_pe_expanded.to(x.device) # 加到输入x上
 
@@ -231,7 +329,9 @@ class GridComplexAttention(Attention):
 
         if self.sr_ratio > 1:
             x_ = x.permute(0, 2, 1).reshape(B, C, H, W)
-            x_ = self.sr(x_).reshape(B, C, -1).permute(0, 2, 1)
+            x_ = self.sr(x_)
+            H_, W_ = x_.shape[-2], x_.shape[-1]
+            x_ = x_.reshape(B, C, -1).permute(0, 2, 1)
             x_ = self.norm(x_)
             kv = self.kv(x_).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         else:
@@ -239,24 +339,61 @@ class GridComplexAttention(Attention):
         k, v = kv[0], kv[1]
 
         # 创建位置编码, 这里head_dim是一个头的维度
-        pos_list = [(i, j) for i in range(H) for j in range(W)]
-        grid_pe = GridComplexPositionalEncoding(pos_list, self.head_dim)
+        self.head_dim = C // self.num_heads
+        if N != H * W:
+            H += 1
+            H_range = torch.arange(H, device='cuda')
+            W_range = torch.arange(W, device='cuda')
+            q_pos_list = torch.cartesian_prod(H_range, W_range)[:N]
+        else:
+            H_range = torch.arange(H, device='cuda')
+            W_range = torch.arange(W, device='cuda')
+            q_pos_list = torch.cartesian_prod(H_range, W_range)
+
+        if self.sr_ratio > 1:
+            sample_pos_i = self.sr_ratio * torch.arange(H_, device='cuda', dtype=torch.int) + self.sr_ratio // 2
+            sample_pos_j = self.sr_ratio * torch.arange(W_, device='cuda', dtype=torch.int) + self.sr_ratio // 2
+            k_pos_list = torch.cartesian_prod(sample_pos_i, sample_pos_j)
+        else:
+            k_pos_list = q_pos_list
+
+        grid_pe_for_q = GridComplexPositionalEncoding(q_pos_list, self.head_dim)
+        grid_pe_for_k = GridComplexPositionalEncoding(k_pos_list, self.head_dim)
+
 
         # 应用位置编码到查询和键
-        q = grid_pe.apply_encoding(
+        q = grid_pe_for_q.apply_encoding(
             q
         )  
         # 内部是在做位置编码和输入的矩阵乘法
-        k = grid_pe.apply_encoding(
+        k = grid_pe_for_k.apply_encoding(
             k
         )  
 
-        # 在这里加grid编码
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.real
+        # cuda不支持直接的复数相乘
+        # attn = (q @ k.transpose(-2, -1)) * self.scale
+        q_real = q.real
+        q_imag = q.imag
+        k_real = k.real.transpose(-2, -1)
+        k_imag = k.imag.transpose(-2, -1)
+        # 计算实部和虚部的乘积
+        real_part = q_real @ k_real - q_imag @ k_imag
+        # imag_part = q_real @ k_imag + q_imag @ k_real
+        # 将实部和虚部合并为一个复数张量
+        attn = real_part * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
+        
+        # if attn.dtype != v.dtype:
+        #     vtype = v.dtype
+        #     v = v.to(attn.dtype)
+        #     x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        #     x = x.to(vtype)
+        # else:
+        #     x = (attn @ v).transpose(1, 2).reshape(B, N, C)
 
+        # fast version
+        attn = attn.to(v.dtype)
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -271,7 +408,9 @@ class GridDeepAttention(Attention):
 
         if self.sr_ratio > 1:
             x_ = x.permute(0, 2, 1).reshape(B, C, H, W)
-            x_ = self.sr(x_).reshape(B, C, -1).permute(0, 2, 1)
+            x_ = self.sr(x_)
+            H_, W_ = x_.shape[-2], x_.shape[-1]
+            x_ = x_.reshape(B, C, -1).permute(0, 2, 1)
             x_ = self.norm(x_)
             kv = self.kv(x_).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         else:
@@ -279,25 +418,37 @@ class GridDeepAttention(Attention):
         k, v = kv[0], kv[1]
 
         # 创建位置编码, 这里head_dim是一个头的维度
-        pos_list = [(i, j) for i in range(H) for j in range(W)]
-        grid_pe = GridDeepPositionalEncoding(pos_list, self.head_dim)
+        self.head_dim = C // self.num_heads
+        if N != H * W:
+            H += 1
+            H_range = torch.arange(H, device='cuda')
+            W_range = torch.arange(W, device='cuda')
+            q_pos_list = torch.cartesian_prod(H_range, W_range)[:N]
+        else:
+            H_range = torch.arange(H, device='cuda')
+            W_range = torch.arange(W, device='cuda')
+            q_pos_list = torch.cartesian_prod(H_range, W_range)
         
-        # 建立网络
-        model = ComplexToReal(grid_pe.grid_pe.shape[1], grid_pe.grid_pe.shape[1]) # 输入和输出维度不改变
-        # 确保是一个复数张量
-        if not isinstance(grid_pe.grid_pe, torch.Tensor):
-            grid_pe.grid_pe = torch.view_as_complex(torch.from_numpy(np.stack((grid_pe.grid_pe.real, grid_pe.grid_pe.imag), axis=-1)))
-        # 通过实虚部分离, 直接转成一个实向量.
-        # 现在已经是实数了
-        grid_pe.grid_pe = model(grid_pe.grid_pe)
+        if self.sr_ratio > 1:
+            sample_pos_i = self.sr_ratio * torch.arange(H_, device='cuda', dtype=torch.int) + self.sr_ratio // 2
+            sample_pos_j = self.sr_ratio * torch.arange(W_, device='cuda', dtype=torch.int) + self.sr_ratio // 2
+            k_pos_list = torch.cartesian_prod(sample_pos_i, sample_pos_j)
+        else:
+            k_pos_list = q_pos_list
+
+        grid_pe_for_q = GridDeepPositionalEncoding(q_pos_list, self.head_dim)
+        grid_pe_for_q = self._grid_complex_to_real(grid_pe_for_q)
+
+        grid_pe_for_k = GridDeepPositionalEncoding(k_pos_list, self.head_dim)
+        grid_pe_for_k = self._grid_complex_to_real(grid_pe_for_k)
 
 
         # 应用位置编码到查询和键
-        q = grid_pe.apply_encoding(
+        q = grid_pe_for_q.apply_encoding(
             q
         )  
         # 内部是在做位置编码和输入的矩阵乘法
-        k = grid_pe.apply_encoding(
+        k = grid_pe_for_k.apply_encoding(
             k
         )  
 
@@ -311,6 +462,18 @@ class GridDeepAttention(Attention):
         x = self.proj_drop(x)
 
         return x
+    
+    def _grid_complex_to_real(self, grid_pe):
+        # 建立网络
+        model = ComplexToReal(grid_pe.grid_pe.shape[1], grid_pe.grid_pe.shape[1]).to(grid_pe.grid_pe.device) # 输入和输出维度不改变
+        # 确保是一个复数张量
+        if not isinstance(grid_pe.grid_pe, torch.Tensor):
+            grid_pe.grid_pe = torch.view_as_complex(torch.from_numpy(np.stack((grid_pe.grid_pe.real, grid_pe.grid_pe.imag), axis=-1)))
+        # 通过实虚部分离, 直接转成一个实向量.
+        # 现在已经是实数了
+        grid_pe.grid_pe = model(grid_pe.grid_pe)
+        
+        return grid_pe
 
 
 class Block(nn.Module):
@@ -585,6 +748,16 @@ class CPVTV2(PyramidVisionTransformer):
         return x.mean(dim=1)  # GAP here
 
 
+class PVT(PyramidVisionTransformer):
+    def __init__(self, img_size=224, patch_size=4, in_chans=3, num_classes=1000, embed_dims=[64, 128, 256, 512],
+                 num_heads=[1, 2, 4, 8], mlp_ratios=[4, 4, 4, 4], qkv_bias=False, qk_scale=None, drop_rate=0.,
+                 attn_drop_rate=0., drop_path_rate=0., norm_layer=nn.LayerNorm,
+                 depths=[3, 4, 6, 3], sr_ratios=[8, 4, 2, 1], block_cls=Block,):
+        super(PVT, self).__init__(img_size, patch_size, in_chans, num_classes, embed_dims, num_heads,
+                                                    mlp_ratios, qkv_bias, qk_scale, drop_rate, attn_drop_rate,
+                                                    drop_path_rate, norm_layer, depths, sr_ratios, block_cls,)
+
+
 class GridPVT(PyramidVisionTransformer):
     def __init__(self, attention, img_size=224, patch_size=4, in_chans=3, num_classes=1000, embed_dims=[64, 128, 256, 512],
                  num_heads=[1, 2, 4, 8], mlp_ratios=[4, 4, 4, 4], qkv_bias=False, qk_scale=None, drop_rate=0.,
@@ -645,6 +818,15 @@ def _conv_filter(state_dict, patch_size=16):
 
 
 @register_model
+def pvt_small(pretrained=False, **kwargs):
+    model = PyramidVisionTransformer(
+        patch_size=4, embed_dims=[64, 128, 320, 512], num_heads=[1, 2, 5, 8], mlp_ratios=[8, 8, 4, 4], qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=[3, 4, 6, 3], sr_ratios=[8, 4, 2, 1],
+        **kwargs)
+    model.default_cfg = _cfg()
+    return model
+
+@register_model
 def pcpvt_small_v0(pretrained=False, **kwargs):
     model = CPVTV2(
         patch_size=4, embed_dims=[64, 128, 320, 512], num_heads=[1, 2, 5, 8], mlp_ratios=[8, 8, 4, 4], qkv_bias=True,
@@ -686,6 +868,17 @@ def gridpvt_split(pretrained=False, **kwargs):
 
 
 @register_model
+def gridpvt_rotate(pretrained=False, **kwargs):
+    model = GridPVT(
+        attention=GridRotateAttention,
+        patch_size=4, embed_dims=[64, 128, 320, 512], num_heads=[1, 2, 5, 8], mlp_ratios=[8, 8, 4, 4], qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=[3, 4, 6, 3], sr_ratios=[8, 4, 2, 1],
+        **kwargs)
+    model.default_cfg = _cfg()
+    return model
+
+
+@register_model
 def gridpvt_merge(pretrained=False, **kwargs):
     model = GridPVT(
         attention=GridMergingAttention,        
@@ -711,6 +904,17 @@ def gridpvt_complex(pretrained=False, **kwargs):
 def gridpvt_deep(pretrained=False, **kwargs):
     model = GridPVT(
         attention=GridDeepAttention,        
+        patch_size=4, embed_dims=[64, 128, 320, 512], num_heads=[1, 2, 5, 8], mlp_ratios=[8, 8, 4, 4], qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=[3, 4, 6, 3], sr_ratios=[8, 4, 2, 1],
+        **kwargs)
+    model.default_cfg = _cfg()
+    return model
+
+
+@register_model
+def abspvt(pretrained=False, **kwargs):
+    model = GridPVT(
+        attention=AbsAttention,        
         patch_size=4, embed_dims=[64, 128, 320, 512], num_heads=[1, 2, 5, 8], mlp_ratios=[8, 8, 4, 4], qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=[3, 4, 6, 3], sr_ratios=[8, 4, 2, 1],
         **kwargs)

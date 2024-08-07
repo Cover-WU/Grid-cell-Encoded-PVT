@@ -67,7 +67,7 @@ def build_dataset(is_train, args):
                 'train' if is_train else 'val',
                 pipeline=transform
             )
-        nb_classes = 1000
+        nb_classes = 100
     elif args.data_set == 'INAT':
         dataset = INatDataset(args.data_path, train=is_train, year=2018,
                               category=args.inat_category, transform=transform)
