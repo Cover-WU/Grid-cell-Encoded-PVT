@@ -286,13 +286,14 @@ class GridComplexPositionalEncoding:
         return encoded
 
 class ComplexToReal(nn.Module):
-    def __init__(self, input_dim, output_dim):
+    def __init__(self, input_dim, output_dim, device='cuda'):
         super(ComplexToReal, self).__init__()
         # 因为输入是复数，所以输入维度是实部和虚部的总和
         self.real_layer = nn.Linear(input_dim, output_dim)
         self.imag_layer = nn.Linear(input_dim, output_dim)
         # 输出合并实部和虚部
         self.combine_layer = nn.Linear(2 * output_dim, output_dim)
+        self.to(device)
 
     def forward(self, complex_tensor):
         # 分离实部和虚部

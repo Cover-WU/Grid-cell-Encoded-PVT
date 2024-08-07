@@ -465,7 +465,7 @@ class GridDeepAttention(Attention):
     
     def _grid_complex_to_real(self, grid_pe):
         # 建立网络
-        model = ComplexToReal(grid_pe.grid_pe.shape[1], grid_pe.grid_pe.shape[1]).to(grid_pe.grid_pe.device) # 输入和输出维度不改变
+        model = ComplexToReal(grid_pe.grid_pe.shape[1], grid_pe.grid_pe.shape[1], device=grid_pe.grid_pe.device) # 输入和输出维度不改变
         # 确保是一个复数张量
         if not isinstance(grid_pe.grid_pe, torch.Tensor):
             grid_pe.grid_pe = torch.view_as_complex(torch.from_numpy(np.stack((grid_pe.grid_pe.real, grid_pe.grid_pe.imag), axis=-1)))
